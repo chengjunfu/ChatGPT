@@ -1,0 +1,213 @@
+by Ian Macartney
+
+Building a Full-Stack ChatGPT app
+Many conversation threads with OpenAI's ChatGPT
+In this post, we’ll walk through putting together a full-stack chat app, and add some features.
+
+We’ll use React and Vite, though any React framework works. We’ll use Convex as the backend, where our server-side functions will run, and where we’ll store our app’s data.
+
+To see this in action, the code is here, and a running version is here (for now). You can clone it and run it yourself with a few configurations in the README, but read on to see a step by step guide on building your own. Also, the published version uses the "authed" branch in the repo, in case you want to see how simple it is to add auth.
+
+To run this yourself, you’ll need to make an OpenAI account and get an API key.
+
+If you’re familiar with Convex, you can skip ahead to step 2.
+
+Build in minutes, scale forever.
+Convex is the backend application platform with everything you need to build your project. Cloud functions, a database, file storage, scheduling, search, and realtime updates fit together seamlessly.
+
+Get started
+0. Bootstrap a Vite React app
+If you don’t already have an app, we can make one:
+
+npm create vite@latest
+
+I picked convex-chatgpt as the project name, React as the framework, and Javascript as the variant.
+
+At this point, if we run:
+
+npm install
+npm run dev
+
+we have a locally running webapp.
+
+Let’s change src/App.jsx to list messages and have a form to submit messages:
+
+App.jsx
+At this point, we have an app that shows a static list of messages and logs to the console when trying to send a message.
+
+1. Add Convex
+This is similar to the Convex quickstart. In a new terminal (leave the other one running npm run dev):
+
+npm install convex
+npx convex init
+
+If you haven’t used convex before, you’ll be prompted to log in, create an account, etc. I picked convex-chatgpt as the project name.
+
+Let’s add the ability to send messages and list messages. We will add functions that run in Convex (on a server) that will read and write to the database with a query and mutation.
+
+Add convex/messages.ts:
+
+import { query, mutation } from "./_generated/server";
+
+export const list = query(async ({ db }) => {
+  return await db.query("messages").collect();
+});
+
+export const send = mutation(async ({ db }, { body }) => {
+  await db.insert("messages", {
+    body,
+    author: "user",
+  });
+  const botMessageId = await db.insert("messages", {
+    author: "assistant",
+  });
+});
+
+In a separate terminal from the one running npm run dev, run npx convex dev. This will deploy these functions to your new Convex backend, and as you edit the functions, it will automatically re-deploy. This will ask you to save the deployment URL into your .env and .env.local files: these point at your convex backends for your production and development deployments. We’ll just be working with the development deployment.
+
+To access Convex from inside React, you’ll need to add a <ConvexProvider> context at the top level of your app. Edit main.jsx:
+
+...
+import { ConvexProvider, ConvexReactClient } from "convex/react";
+
+const convex = new ConvexReactClient(import.meta.env.VITE_CONVEX_URL);
+
+ReactDOM.createRoot(document.getElementById("root")).render(
+  <React.StrictMode>
+    <ConvexProvider client={convex}>
+      <App />
+    </ConvexProvider>
+  </React.StrictMode>,
+);
+
+We can then use these functions from App.jsx:
+
+function App() {
+  const messages = useQuery("messages:list") || [];
+  const sendMessage = useMutation("messages:send");
+	...
+
+Great! Now we have messages being written to and from the database. Try it out! Those new to Convex will be surprised to see that adding new messages will automatically result in the useQuery("messages:list") hook returning new messages. This is part of the magic of Convex. Learn more about it here.
+
+You can check out your data in the dashboard: npx convex dashboard.
+
+You may note that the query and mutation are named by the filename:function. See more about this here.
+
+You’ll notice every time we send a message, there’s a “…” message from the assistant. Next let’s update that message from chatGPT.
+
+2. Send a message to the ChatGPT API
+So far we’ve been working with a query and mutation, which are Convex functions that interact with the database. In order to interact with external services, we need to do that in an “action” - which is a Convex function that isn’t inside a deterministic environment and isn’t part of a database transaction. This frees us to do things with side effects, such as making requests to OpenAI’s API. We’ll do this in a few steps.
+
+Fetching messages to send to ChatGPT
+In our send mutation, we can grab the latest 10 messages to send to ChatGPT using a database query:
+
+export const send = mutation(async ({ db }, { body }) => {
+  //... insert messages to the table
+  const messages = await db
+    .query("messages")
+    .order("desc")
+    .filter((q) => q.neq(q.field("body"), undefined))
+    .take(21);
+  messages.reverse();
+  return { messages, botMessageId };
+});
+
+This orders messages in descending order (sorted by creation time unless you use a different index), filters out messages with no body (for instance, the new placeholder system message), and takes the first 21 (which are the 21 most recent messages). It then reverses the list so it’s ordered in ascending time order. I picked 21 so that we’ll have 10 pairs of user/bot messages, followed by the latest prompt. It returns the messages to be used as input to the chat completion API, which we'll add next.
+
+Creating the action
+We’ll use the openai npm package. You can install it with:
+
+npm install openai
+
+Make a new file: convex/openai.js:
+
+"use node";
+import { Configuration, OpenAIApi } from "openai";
+import { action } from "../_generated/server";
+
+export const chat = action(async ({ runMutation }, { body }) => {
+  const { messages, botMessageId } = await runMutation("messages:send", { body });
+  const fail = async (reason) => throw new Error(reason);
+  // Grab the API key from environment variables
+  // Specify this in your dashboard: `npx convex dashboard`
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) {
+    await fail("Add your OPENAI_API_KEY as an env variable");
+  }
+  const configuration = new Configuration({ apiKey });
+  const openai = new OpenAIApi(configuration);
+
+  const openaiResponse = await openai.createChatCompletion({
+    model: "gpt-3.5-turbo",
+    messages: [
+      {
+        role: "system",
+        content: instructions,
+      },
+      ...messages.map(({ body, author }) => ({
+        role: author,
+        content: body,
+      })),
+    ],
+  });
+  if (openaiResponse.status !== 200) {
+    await fail("OpenAI error: " + openaiResponse.statusText);
+  }
+  const body = openaiResponse.data.choices[0].message.content;
+	console.log("Response: " + body);
+});
+
+This will first send the messages with the send mutation we modified, getting in return the list of messages and message ID to update with the bot’s message. It will then make a request to the gpt-3.5-turbo model, passing in one system message with instructions (hard-coded for now), followed by each message. We’re turning our body & author fields into “role” and “content”. See their docs here for more details on the API.
+
+Add your API key to the dashboard
+To authenticate requests to OpenAI, you’ll need to add your API key to the Convex dashboard, so your action (which runs on Convex’s servers) has access to it. Go to your dashboard with npx convex dashboard and on the left panel go into Settings and add the key with the name OPENAI_API_KEY. While you’re there, you can add it as an env variable to both your production and development deployments by toggling the dropdown in the left panel.
+
+Dashboard side panel
+Dashboard side panel
+Triggering the action from the UI
+We can change our call to useQuery("messages:send") to
+
+const sendMessage = useAction("openai:chat");
+
+Note the action is addressed by the path to the file (openai) and the function (chat). The API is the same (taking one argument, body), so it’s a drop-in replacement!
+
+At this point, if you run it, it will send a request to ChatGPT and console.log the response. Convex prints Convex function logs to the browser’s console, though you can also see them in the dashboard, to prove to yourself it’s running in the cloud. Now let’s show them in the UI.
+
+Updating the message with the reply
+In order to get the response into the chat message, we’ll want to update the empty placeholder message we added. Treat each call to a mutation as a transaction. Once we called our first mutation, the messages were committed to the database and the UI could show the new messages before doing the slow call to OpenAI. Once we get the response, we update the bot’s message and the UI will update automatically via the messages:list query. We’ll add a new mutation in the convex/messages.js file:
+
+// An `internalMuation` can only be called from other server functions.
+export const update = internalMutation(async ({ db }, { messageId, patch }) => {
+  await db.patch(messageId, patch);
+});
+
+This patches the specified message. You could pass in {body: "hi"} to change the message’s body to “hi,” for example. Since the first mutation returned the botMessageId, we can use that from the action in convex/openai.js:
+
+export const chat = action(async ({ runMutation }, { body }) => {
+  const { messages, botMessageId } = await runMutation("messages:send", { body });
+
+  // Call OpenAI
+
+  await runMutation("messages:update", {
+    messageId: botMessageId, 
+    patch: {
+      body: openaiResponse.data.choices[0].message.content,
+      // Track how many tokens we're using for various messages
+      usage: openaiResponse.data.usage,
+      updatedAt: Date.now(),
+      // How long it took OpenAI
+      ms: Number(openaiResponse.headers["openai-processing-ms"]),
+    }
+  });
+});
+
+While we’re here, we can store a bunch of interesting data into the message along with the body. Convex’s database is flexible enough to store strings, numbers, javascript objects, Maps, etc. while also letting you nail down a schema later to get typescript types, autocomplete, etc.
+
+🎉 Now you have chatGPT replying to your messages!
+
+Summary
+In this post, we made a full-stack web app to chat with OpenAI’s ChatGPT API. Let us know in Discord what you think, and if you’d like to see some extensions:
+
+Customizing the identity you’re talking to.
+Moderating the identities and messages to prevent harmful content.
+Create new message threads. (See the code for how it's done!)
